@@ -12,6 +12,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+from commands.library_resolution import stamp, watched_files
+from commands.library_tables import global_table_path
 from utils.kicad_roots import kicad_install_roots
 from utils.platform_helper import PlatformHelper
 
@@ -41,10 +43,14 @@ class LibraryManager:
     def _load_libraries(self) -> None:
         """Load libraries from fp-lib-table files"""
         # Load global libraries
+        # Every table read, nested ones included, for refresh_if_stale.
+        tables_read: Set[str] = set()
         global_table = self._get_global_fp_lib_table()
         if global_table and global_table.exists():
             logger.info(f"Loading global fp-lib-table from: {global_table}")
-            self._parse_fp_lib_table(global_table)
+            seen: Set[str] = set()
+            self._parse_fp_lib_table(global_table, seen)
+            tables_read |= seen
         else:
             logger.warning(f"Global fp-lib-table not found at: {global_table}")
 
@@ -53,33 +59,42 @@ class LibraryManager:
             project_table = self.project_path / "fp-lib-table"
             if project_table.exists():
                 logger.info(f"Loading project fp-lib-table from: {project_table}")
-                self._parse_fp_lib_table(project_table)
+                seen = set()
+                self._parse_fp_lib_table(project_table, seen)
+                tables_read |= seen
 
         logger.info(f"Loaded {len(self.libraries)} footprint libraries")
+        self._watched = watched_files("fp-lib-table", self.project_path, tables_read)
+        self._stamp = stamp(self._watched)
+
+    def refresh_if_stale(self) -> None:
+        """Reload the libraries if a table or kicad_common.json changed on disk.
+
+        The manager lives as long as the server process. Without this, a
+        library registered after startup -- or one behind a path variable
+        defined after startup -- stays "not found" until a restart.
+        """
+        watched = getattr(self, "_watched", None)
+        if watched is None or stamp(watched) == self._stamp:
+            return
+        logger.info("Library tables changed on disk; reloading footprint libraries")
+        self.libraries.clear()
+        self.footprint_cache.clear()
+        self._load_libraries()
 
     def _get_global_fp_lib_table(self) -> Optional[Path]:
-        """Get path to global fp-lib-table file"""
-        # Try different possible locations
-        kicad_config_paths = [
-            Path.home() / ".config" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "8.0" / "fp-lib-table",
-            Path.home() / ".config" / "kicad" / "fp-lib-table",
-            # Windows paths
-            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "fp-lib-table",
-            # macOS paths
-            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "fp-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "fp-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "fp-lib-table",
-        ]
+        """Get path to the global fp-lib-table file.
 
-        for path in kicad_config_paths:
-            if path.exists():
-                return path
-
-        return None
+        The newest KiCad version's table, found the same way list_library_table
+        and the symbol loader find it (honouring KICAD_CONFIG_HOME, APPDATA and
+        XDG_CONFIG_HOME), so every tool reads the same table. A pre-version
+        ~/.config/kicad/fp-lib-table is the last resort.
+        """
+        found = global_table_path("footprint")
+        if found is not None:
+            return found
+        legacy = Path.home() / ".config" / "kicad" / "fp-lib-table"
+        return legacy if legacy.exists() else None
 
     def _parse_fp_lib_table(
         self,
@@ -260,10 +275,12 @@ class LibraryManager:
 
     def list_libraries(self) -> List[str]:
         """Get list of available library nicknames"""
+        self.refresh_if_stale()
         return list(self.libraries.keys())
 
     def get_library_path(self, nickname: str) -> Optional[str]:
         """Get filesystem path for a library nickname"""
+        self.refresh_if_stale()
         return self.libraries.get(nickname)
 
     def list_footprints(self, library_nickname: str) -> List[str]:
@@ -276,6 +293,7 @@ class LibraryManager:
         Returns:
             List of footprint names (without .kicad_mod extension)
         """
+        self.refresh_if_stale()
         # Check cache first
         if library_nickname in self.footprint_cache:
             return self.footprint_cache[library_nickname]
@@ -319,6 +337,7 @@ class LibraryManager:
         Returns:
             Tuple of (library_path, footprint_name) or None if not found
         """
+        self.refresh_if_stale()
         # Parse specification
         if ":" in footprint_spec:
             # Format: Library:Footprint
@@ -361,6 +380,7 @@ class LibraryManager:
         Returns:
             List of dicts with 'library', 'footprint', and 'full_name' keys
         """
+        self.refresh_if_stale()
         results = []
         pattern_lower = pattern.lower()
 
@@ -399,6 +419,7 @@ class LibraryManager:
         Returns:
             Dict with footprint information or None if not found
         """
+        self.refresh_if_stale()
         library_path = self.libraries.get(library_nickname)
         if not library_path:
             return None
@@ -495,21 +516,35 @@ class LibraryCommands:
     def get_footprint_info(self, params: Dict) -> Dict:
         """Get information about a specific footprint"""
         try:
-            footprint_spec = params.get("footprint_name")
+            footprint_spec = params.get("footprint_name") or params.get("footprint")
             if not footprint_spec:
                 return {"success": False, "message": "Missing footprint parameter"}
+            # The tool passes the library separately; without it the name was
+            # searched in every library and the first same-named footprint won.
+            library_name = params.get("library_name") or params.get("library")
+            if library_name and ":" not in footprint_spec:
+                footprint_spec = f"{library_name}:{footprint_spec}"
 
             # Try to find the footprint
             result = self.library_manager.find_footprint(footprint_spec)
+            if not result:
+                lib, _, name = footprint_spec.rpartition(":")
+                if lib and self.library_manager.get_library_path(lib) is None:
+                    message = (
+                        f"Footprint library '{lib}' is not in the project or global "
+                        "fp-lib-table (nested tables included)"
+                    )
+                else:
+                    message = f"Footprint not found: {footprint_spec}"
+                return {"success": False, "message": message}
 
-            if result:
-                library_path, footprint_name = result
-                # Extract library nickname from path
-                library_nickname = None
-                for nick, path in self.library_manager.libraries.items():
-                    if path == library_path:
-                        library_nickname = nick
-                        break
+            library_path, footprint_name = result
+            # Extract library nickname from path
+            library_nickname = None
+            for nick, path in self.library_manager.libraries.items():
+                if path == library_path:
+                    library_nickname = nick
+                    break
 
             # Minimal info — always returned even if the parser fails
             info: Dict = {

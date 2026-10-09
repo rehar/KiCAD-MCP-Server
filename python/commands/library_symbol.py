@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+from commands.library_resolution import stamp, watched_files
+from commands.library_tables import global_table_path
 from utils.kicad_roots import kicad_install_roots
 from utils.platform_helper import PlatformHelper
 from utils.sexpr_format import QUOTED_VALUE, unescape_sexpr_string
@@ -121,10 +123,14 @@ class SymbolLibraryManager:
     def _load_libraries(self) -> None:
         """Load libraries from sym-lib-table files"""
         # Load global libraries
+        # Every table read, nested ones included, for refresh_if_stale.
+        tables_read: Set[str] = set()
         global_table = self._get_global_sym_lib_table()
         if global_table and global_table.exists():
             logger.info(f"Loading global sym-lib-table from: {global_table}")
-            self._parse_sym_lib_table(global_table)
+            seen: Set[str] = set()
+            self._parse_sym_lib_table(global_table, seen)
+            tables_read |= seen
         else:
             logger.warning(f"Global sym-lib-table not found at: {global_table}")
 
@@ -133,33 +139,42 @@ class SymbolLibraryManager:
             project_table = self.project_path / "sym-lib-table"
             if project_table.exists():
                 logger.info(f"Loading project sym-lib-table from: {project_table}")
-                self._parse_sym_lib_table(project_table)
+                seen = set()
+                self._parse_sym_lib_table(project_table, seen)
+                tables_read |= seen
 
         logger.info(f"Loaded {len(self.libraries)} symbol libraries")
+        self._watched = watched_files("sym-lib-table", self.project_path, tables_read)
+        self._stamp = stamp(self._watched)
+
+    def refresh_if_stale(self) -> None:
+        """Reload the libraries if a table or kicad_common.json changed on disk.
+
+        The manager lives as long as the server process. Without this, a
+        library registered after startup -- or one behind a path variable
+        defined after startup -- stays "not found" until a restart.
+        """
+        watched = getattr(self, "_watched", None)
+        if watched is None or stamp(watched) == self._stamp:
+            return
+        logger.info("Library tables changed on disk; reloading symbol libraries")
+        self.libraries.clear()
+        self.symbol_cache.clear()
+        self._load_libraries()
 
     def _get_global_sym_lib_table(self) -> Optional[Path]:
-        """Get path to global sym-lib-table file"""
-        # Try different possible locations (same as fp-lib-table but for symbols)
-        kicad_config_paths = [
-            Path.home() / ".config" / "kicad" / "10.0" / "sym-lib-table",
-            Path.home() / ".config" / "kicad" / "9.0" / "sym-lib-table",
-            Path.home() / ".config" / "kicad" / "8.0" / "sym-lib-table",
-            Path.home() / ".config" / "kicad" / "sym-lib-table",
-            # Windows paths
-            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "sym-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "sym-lib-table",
-            Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "sym-lib-table",
-            # macOS paths
-            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "sym-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "sym-lib-table",
-            Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "sym-lib-table",
-        ]
+        """Get path to the global sym-lib-table file.
 
-        for path in kicad_config_paths:
-            if path.exists():
-                return path
-
-        return None
+        The newest KiCad version's table, found the same way list_library_table
+        and the symbol loader find it (honouring KICAD_CONFIG_HOME, APPDATA and
+        XDG_CONFIG_HOME), so every tool reads the same table. A pre-version
+        ~/.config/kicad/sym-lib-table is the last resort.
+        """
+        found = global_table_path("symbol")
+        if found is not None:
+            return found
+        legacy = Path.home() / ".config" / "kicad" / "sym-lib-table"
+        return legacy if legacy.exists() else None
 
     def _parse_sym_lib_table(
         self,
@@ -456,10 +471,12 @@ class SymbolLibraryManager:
 
     def list_libraries(self) -> List[str]:
         """Get list of available library nicknames"""
+        self.refresh_if_stale()
         return list(self.libraries.keys())
 
     def get_library_path(self, nickname: str) -> Optional[str]:
         """Get filesystem path for a library nickname"""
+        self.refresh_if_stale()
         return self.libraries.get(nickname)
 
     def list_symbols(self, library_nickname: str) -> List[SymbolInfo]:
@@ -472,6 +489,7 @@ class SymbolLibraryManager:
         Returns:
             List of SymbolInfo objects
         """
+        self.refresh_if_stale()
         # Check cache first
         cached = self.symbol_cache.get(library_nickname)
         if cached is not None:
@@ -527,6 +545,7 @@ class SymbolLibraryManager:
         Returns:
             List of SymbolInfo objects sorted by relevance
         """
+        self.refresh_if_stale()
         results = []
         query_lower = query.lower()
 
@@ -636,6 +655,7 @@ class SymbolLibraryManager:
         Returns:
             SymbolInfo or None if not found
         """
+        self.refresh_if_stale()
         if ":" in symbol_spec:
             # Format: Library:Symbol
             library_nickname, symbol_name = symbol_spec.split(":", 1)

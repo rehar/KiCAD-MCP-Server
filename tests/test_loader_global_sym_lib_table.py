@@ -45,6 +45,22 @@ def _write_table(table_path: Path, libs: list) -> None:
     table_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _config_from_fake_home(monkeypatch):
+    """Point KiCad's config lookup at the faked home only.
+
+    The global table is found through PlatformHelper.kicad_config_dirs, which
+    honours KICAD_CONFIG_HOME, APPDATA and XDG_CONFIG_HOME before the home
+    directory; any of them set in the developer's shell would otherwise put
+    the real global table in front of the test's.
+    """
+    for var in ("KICAD_CONFIG_HOME", "APPDATA", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    DynamicSymbolLoader.clear_library_caches()
+    yield
+    DynamicSymbolLoader.clear_library_caches()
+
+
 def test_global_sym_lib_table_resolves_library(monkeypatch, tmp_path):
     """Library registered only in the user-global table must resolve."""
     # Lay out a fake user home with the library in a non-standard location

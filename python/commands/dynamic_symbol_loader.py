@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from commands.library_resolution import describe_unusable, find_library
 from utils.file_io import read_text_preserve_newline, write_text_atomic
 from utils.sexpr_format import (
     QUOTED_VALUE,
@@ -158,7 +159,12 @@ class DynamicSymbolLoader:
            ~/Library/Preferences/kicad/<ver>/sym-lib-table on macOS) — covers user-
            registered libraries that live outside the bundled symbol directories
            (e.g. company libraries in OneDrive, network shares, custom paths).
+           Both tables are read through commands.library_resolution, which
+           follows (type "Table") rows into the tables they name and expands
+           the path variables from kicad_common.json.
         3. Bundled / well-known KiCad symbol library directories.
+
+        A database library (type "Database") resolves to its .kicad_dbl file.
 
         Resolution is cached module-wide by (project_path, library_name, env
         fingerprint) so that repeated component adds don't re-scan the
@@ -185,24 +191,14 @@ class DynamicSymbolLoader:
                 return hit
 
         def _search() -> Optional[Path]:
-            # 1. Check project-specific sym-lib-table
-            if self.project_path:
-                project_table = Path(self.project_path) / "sym-lib-table"
-                if project_table.exists():
-                    resolved = self._resolve_library_from_table(project_table, library_name)
-                    if resolved:
-                        logger.info(f"Found '{library_name}' in project sym-lib-table: {resolved}")
-                        return resolved
-
-            # 2. Check global user sym-lib-table
-            for global_table in self._global_sym_lib_table_paths():
-                if global_table.exists():
-                    resolved = self._resolve_library_from_table(global_table, library_name)
-                    if resolved:
-                        logger.info(
-                            f"Found '{library_name}' in global sym-lib-table {global_table}: {resolved}"
-                        )
-                        return resolved
+            # 1./2. The project table, then the global one, following nested
+            # (type "Table") rows and expanding kicad_common.json path variables.
+            row = find_library(library_name, "symbol", self.project_path)
+            if row is not None:
+                if row.exists:
+                    logger.info(f"Found '{library_name}' in {row.table}: {row.path}")
+                    return row.path
+                logger.warning(describe_unusable(row))
 
             # 3. Fall back to bundled / well-known KiCad symbol directories
             for lib_dir in self.find_kicad_symbol_libraries():
@@ -226,80 +222,6 @@ class DynamicSymbolLoader:
                 _LIB_FILE_CACHE[cache_key] = result
             else:
                 _LIB_FILE_CACHE.pop(cache_key, None)
-        return result
-
-    def _global_sym_lib_table_paths(self) -> list:
-        """Candidate paths for the user-global sym-lib-table, newest version first."""
-        home = Path.home()
-        versions = ["10.0", "9.0", "8.0"]
-        bases = []
-        if os.name == "nt":
-            bases.append(home / "AppData" / "Roaming" / "kicad")
-        else:
-            bases.append(home / ".config" / "kicad")
-            bases.append(home / "Library" / "Preferences" / "kicad")  # macOS
-        candidates = []
-        for base in bases:
-            for v in versions:
-                candidates.append(base / v / "sym-lib-table")
-        return candidates
-
-    def _resolve_library_from_table(self, table_path: Path, library_name: str) -> Optional[Path]:
-        """Parse a sym-lib-table file and return the resolved path for the given library nickname."""
-        try:
-            with open(table_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            # Name and URI may be quoted (with embedded spaces, e.g. OneDrive paths)
-            # or bare. Match a quoted "..." form first, otherwise a bareword that
-            # excludes whitespace and parens.
-            lib_pattern = (
-                r"\(lib\s+"
-                r'\(name\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
-                r"\(type\s+[^)]+\)\s*"
-                r'\(uri\s+(?:"([^"]+)"|([^"\)\s]+))'
-            )
-            for match in re.finditer(lib_pattern, content, re.IGNORECASE):
-                # Groups: 1=quoted name, 2=bare name, 3=quoted uri, 4=bare uri
-                nickname = match.group(1) or match.group(2)
-                if nickname != library_name:
-                    continue
-                uri = match.group(3) or match.group(4)
-                resolved = self._resolve_sym_uri(uri)
-                if resolved and Path(resolved).exists():
-                    return Path(resolved)
-        except Exception as e:
-            logger.warning(f"Could not parse sym-lib-table {table_path}: {e}")
-        return None
-
-    def _resolve_sym_uri(self, uri: str) -> Optional[str]:
-        """Resolve environment variables in a sym-lib-table URI."""
-        env_map = {
-            "KICAD10_SYMBOL_DIR": [
-                "/usr/share/kicad/symbols",
-                "C:/Program Files/KiCad/10.0/share/kicad/symbols",
-                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
-            ],
-            "KICAD9_SYMBOL_DIR": [
-                "C:/Program Files/KiCad/9.0/share/kicad/symbols",
-                "/usr/share/kicad/symbols",
-                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
-            ],
-            "KICAD8_SYMBOL_DIR": [
-                "C:/Program Files/KiCad/8.0/share/kicad/symbols",
-            ],
-            "KIPRJMOD": [str(self.project_path)] if self.project_path else [],
-        }
-        result = uri
-        for var, candidates in env_map.items():
-            if f"${{{var}}}" in result:
-                for candidate in candidates:
-                    candidate_path = result.replace(f"${{{var}}}", candidate)
-                    if Path(candidate_path).exists():
-                        return candidate_path
-                # Fallback: try OS env
-                if var in os.environ:
-                    return result.replace(f"${{{var}}}", os.environ[var])
         return result
 
     def _extract_symbol_block(self, text: str, symbol_name: str) -> Optional[str]:
@@ -610,6 +532,19 @@ class DynamicSymbolLoader:
             logger.info(f"Injected symbol {library_name}:{symbol_name} into {sch_name}")
         return True
 
+    def describe_symbol_miss(self, library_name: str, symbol_name: str) -> str:
+        """Why ``extract_symbol_from_library`` found nothing, in one sentence."""
+        lib_path = self.find_library_file(library_name)
+        if lib_path is not None:
+            return f"Symbol '{symbol_name}' not found in library '{library_name}' ({lib_path})"
+        row = find_library(library_name, "symbol", self.project_path)
+        if row is not None:
+            return describe_unusable(row)
+        return (
+            f"Library '{library_name}' is not in the project or global sym-lib-table "
+            "(nested tables included) or the bundled symbol directories"
+        )
+
     def inject_symbol_text(self, content: str, library_name: str, symbol_name: str) -> str:
         """Return *content* with the library symbol added to its lib_symbols section.
 
@@ -627,7 +562,7 @@ class DynamicSymbolLoader:
         # Extract symbol from library
         symbol_block = self.extract_symbol_from_library(library_name, symbol_name)
         if not symbol_block:
-            raise ValueError(f"Symbol '{symbol_name}' not found in library '{library_name}'")
+            raise ValueError(self.describe_symbol_miss(library_name, symbol_name))
 
         # Indent the block to match lib_symbols indentation (4 spaces for top-level)
         indented_lines = []
