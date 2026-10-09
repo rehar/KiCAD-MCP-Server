@@ -143,13 +143,26 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
   // Replace instance lib_ids per mapping (library migration)
   server.tool(
     "replace_instance_lib_ids",
-    "Replace lib_id references in schematic symbol instances per an explicit old-to-new mapping — the mechanical layer of a library migration (e.g. eagle_import symbols to curated library symbols). Mirror-variant suffixes (__m0/__m90/__m180/__m270) get automatic angle correction; each needs its own mapping entry. Only instances are rewritten; lib_symbols is preserved (use update_symbol_from_library to refresh definitions afterwards).",
+    "Replace lib_id references in schematic symbol instances — the mechanical layer of a library migration (e.g. eagle_import symbols to curated library symbols). Two modes. mapping: old lib_id -> new lib_id for every instance; mirror-variant suffixes (__m0/__m90/__m180/__m270) get automatic angle correction, each needs its own entry, and lib_symbols is preserved (use update_symbol_from_library afterwards). byReference: reference -> new lib_id, for parts that share one old lib_id but need different targets (e.g. database parts Db:Capacitors/C-0001); every unit is relinked in place without moving anything, the new symbol is loaded into lib_symbols, a database part's Value/Footprint/fields come from its row, and a target whose pins sit elsewhere is refused unless allowPinChange. A byReference call changes nothing unless every reference can be relinked.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       mapping: z
         .record(z.string())
+        .optional()
         .describe(
           'Map of old full lib_id to new full lib_id, e.g. {"eagle_import:C_100n": "Device:C"}. Values are used verbatim.',
+        ),
+      byReference: z
+        .record(z.string())
+        .optional()
+        .describe(
+          'Map of reference to new full lib_id, e.g. {"C22": "NIVA-Components:Capacitors/120-00449"}. Use instead of mapping.',
+        ),
+      allowPinChange: z
+        .boolean()
+        .optional()
+        .describe(
+          "byReference only: relink even when the new symbol's pins are not where the old symbol's were (wires may disconnect). Default false.",
         ),
       sourceLibrary: z
         .string()
@@ -163,7 +176,8 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
         return {
           content: [{ type: "text", text: `Failed: ${r.error || r.message || "Unknown error"}` }],
         };
-      return { content: [{ type: "text", text: r.message }] };
+      const details = r.relinked ? `\n${JSON.stringify(r.relinked, null, 2)}` : "";
+      return { content: [{ type: "text", text: `${r.message}${details}` }] };
     },
   );
 

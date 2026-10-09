@@ -304,3 +304,82 @@ class TestReplaceWithDatabasePart:
         assert result["success"] is False
         assert "No row with Part_Number = 'nope'" in result["message"]
         assert _digest(project) == before
+
+
+def _relink(sch: Path, by_reference: Any, **extra: Any) -> Any:
+    from commands.symbol_schematic import SymbolSchematicCommands
+
+    return SymbolSchematicCommands().replace_instance_lib_ids(
+        {"schematicPath": str(sch), "byReference": by_reference, **extra}
+    )
+
+
+@pytest.mark.unit
+class TestRelinkByReference:
+    """replace_instance_lib_ids(byReference=...): relink in place, per reference."""
+
+    def test_database_part_relinked_in_place(self, project: Path) -> None:
+        before = _instance(project.read_text(encoding="utf-8"))
+        result = _relink(project, {"C22": PART})
+        assert result["success"] is True, result
+        assert result["relinked"]["C22"] == {"from": ["Old:C"], "to": PART, "units": 1}
+
+        text = project.read_text(encoding="utf-8")
+        assert f'(symbol "{PART}"' in text  # loaded into lib_symbols
+        inst = _instance(text)
+        assert inst.startswith(f'(symbol (lib_id "{PART}") (at 101.6 76.2 90)')
+        # Nothing moved: field positions and pin uuids are the old ones.
+        assert '(property "Reference" "C22" (at 101.6 72.39 0)' in inst
+        assert '(pin "1" (uuid "cccccccc-0000-0000-0000-0000000000a1"))' in inst
+        # The row's data replaced the old values; other fields stay.
+        assert '(property "Value" "100n" (at 101.6 80.01 0)' in inst
+        assert '(property "Footprint" "Cap:C0603"' in inst
+        assert '(property "MPN" "GRM-104"' in inst
+        assert '(property "Part Number" "120-00449"' in inst
+        assert '(property "Assembly Note" "hand solder"' in inst
+        assert '(property "Description" "100 nF 25 V X7R"' in inst
+        # Two fields are new: Part Number and Description.
+        assert before.count("(property") + 2 == inst.count("(property")
+
+    def test_ordinary_symbol_keeps_fields(self, project: Path) -> None:
+        assert _relink(project, {"C22": "TestLib:C"})["success"] is True
+        inst = _instance(project.read_text(encoding="utf-8"))
+        assert inst.startswith('(symbol (lib_id "TestLib:C")')
+        assert '(property "Value" "100nF"' in inst
+        assert '(property "MPN" "OLD-MPN"' in inst
+
+    def test_moved_pins_are_refused(self, project: Path) -> None:
+        lib = project.parent / "TestLib.kicad_sym"
+        lib.write_text(
+            lib.read_text(encoding="utf-8").replace("(at 0 -3.81 90)", "(at 0 -6.35 90)"),
+            encoding="utf-8",
+        )
+        before = _digest(project)
+        result = _relink(project, {"C22": "TestLib:C"})
+        assert result["success"] is False
+        assert "pins of TestLib:C differ" in result["error"]
+        assert _digest(project) == before
+
+        assert _relink(project, {"C22": "TestLib:C"}, allowPinChange=True)["success"] is True
+
+    def test_one_bad_reference_changes_nothing(self, project: Path) -> None:
+        before = _digest(project)
+        result = _relink(project, {"C22": PART, "C99": PART})
+        assert result["success"] is False
+        assert "C99: not found" in result["error"]
+        assert _digest(project) == before
+
+    def test_unloadable_target_changes_nothing(self, project: Path) -> None:
+        before = _digest(project)
+        result = _relink(project, {"C22": "Parts:Passive Caps/nope"})
+        assert result["success"] is False
+        assert "No row with Part_Number = 'nope'" in result["error"]
+        assert _digest(project) == before
+
+    def test_mapping_and_by_reference_are_exclusive(self, project: Path) -> None:
+        from commands.symbol_schematic import SymbolSchematicCommands
+
+        result = SymbolSchematicCommands().replace_instance_lib_ids(
+            {"schematicPath": str(project), "mapping": {"a:b": "c:d"}, "byReference": {"C22": PART}}
+        )
+        assert result["success"] is False
