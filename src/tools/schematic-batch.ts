@@ -170,7 +170,7 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
   // Swap a symbol, preserving position/fields
   server.tool(
     "replace_schematic_component",
-    "Replace a placed component's symbol with a different one (e.g. Device:R -> Device:R_Potentiometer), preserving its position, rotation, and field values (Value/Footprint/custom). Optionally override rotation with newRotation. Returns the new pin positions.",
+    "Replace a placed component's symbol with a different one (e.g. Device:R -> Device:R_Potentiometer), preserving its position, rotation, and field values (Value/Footprint/custom). A database-library part (e.g. MyDb:Capacitors/C-0001) takes its Value, Footprint and fields from its database row instead; old fields are kept only where the row leaves them empty. Set removeOldFields to drop the old custom fields entirely. Optionally override rotation with newRotation. The file is left unchanged if anything fails. Returns the new pin positions.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference of the component to replace (e.g., D1)"),
@@ -179,14 +179,21 @@ export function registerSchematicBatchTools(server: McpServer, callKicadScript: 
         .number()
         .optional()
         .describe("Override rotation in degrees (default: keep existing)"),
+      removeOldFields: z
+        .boolean()
+        .optional()
+        .describe(
+          "Drop the old symbol's custom fields instead of copying them onto the new one (default false). Use when relinking to a part whose own fields replace them, e.g. a database part.",
+        ),
     },
     async (args: any) => {
       const r = await callKicadScript("replace_schematic_component", args);
-      return {
-        content: [
-          { type: "text", text: r.success ? r.message : `Failed: ${r.message || "Unknown error"}` },
-        ],
-      };
+      const text = r.success
+        ? r.warning
+          ? `${r.message}\nWarning: ${r.warning}`
+          : r.message
+        : `Failed: ${r.message || "Unknown error"}`;
+      return { content: [{ type: "text", text }] };
     },
   );
 

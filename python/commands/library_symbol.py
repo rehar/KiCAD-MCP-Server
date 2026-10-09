@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+from commands.database_library import DatabaseLibrary, DatabaseLibraryError
 from commands.library_resolution import stamp, watched_files
 from commands.library_tables import global_table_path
 from utils.kicad_roots import kicad_install_roots
@@ -499,6 +500,8 @@ class SymbolLibraryManager:
         if not library_path:
             logger.warning(f"Library not found: {library_nickname}")
             return []
+        if library_path.endswith(".kicad_dbl"):
+            return self._list_database_symbols(library_nickname, library_path)
 
         # Then the process-wide cache keyed by file path, so the same library is
         # parsed once even across many manager instances / warm-up threads. The
@@ -529,6 +532,54 @@ class SymbolLibraryManager:
         with self._cache_lock:
             self.symbol_cache[library_nickname] = symbols
 
+        return symbols
+
+    def _list_database_symbols(self, library_nickname: str, library_path: str) -> List[SymbolInfo]:
+        """One SymbolInfo per row of a database library (``<library>/<key>``).
+
+        Cached like a .kicad_sym, but keyed on the .kicad_dbl and the SQLite
+        file both, since editing the data is the usual change.
+        """
+        try:
+            db = DatabaseLibrary(Path(library_path), PlatformHelper.load_kicad_env_vars())
+            stamp_key = tuple(
+                (str(p), p.stat().st_mtime_ns if p.exists() else None) for p in db.source_files()
+            )
+        except (DatabaseLibraryError, OSError) as e:
+            logger.warning(f"Cannot read database library {library_nickname}: {e}")
+            return []
+        with _SYMBOL_CACHE_LOCK:
+            entry = _SYMBOL_CACHE_BY_PATH.get(library_path)
+        if entry is not None and entry[0] == stamp_key:
+            with self._cache_lock:
+                self.symbol_cache[library_nickname] = entry[1]
+            return entry[1]
+
+        symbols: List[SymbolInfo] = []
+        try:
+            for part in db.parts():
+                fields = {name.lower(): value for name, value, _vis, _show in part.fields}
+                symbols.append(
+                    SymbolInfo(
+                        name=part.name,
+                        library=library_nickname,
+                        full_ref=f"{library_nickname}:{part.name}",
+                        value=fields.get("value", ""),
+                        description=part.description,
+                        footprint=part.footprints[0] if part.footprints else "",
+                        manufacturer=fields.get("manufacturer", ""),
+                        mpn=fields.get("mpn", fields.get("manufacturer part number", "")),
+                        category=part.name.split("/", 1)[0],
+                        datasheet=fields.get("datasheet", ""),
+                    )
+                )
+        except DatabaseLibraryError as e:
+            logger.warning(f"Cannot list database library {library_nickname}: {e}")
+            return []
+        with _SYMBOL_CACHE_LOCK:
+            _SYMBOL_CACHE_BY_PATH[library_path] = (stamp_key, symbols)
+        with self._cache_lock:
+            self.symbol_cache[library_nickname] = symbols
         return symbols
 
     def search_symbols(

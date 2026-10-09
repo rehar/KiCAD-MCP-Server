@@ -29,6 +29,7 @@ from commands.schematic_text_utils import (
 )
 from commands.wire_manager import WireManager
 from utils.file_io import read_text_preserve_newline, write_text_atomic
+from utils.sexpr_format import QUOTED_VALUE
 from utils.symbol_instances import add_missing_instances, instance_report
 
 logger = logging.getLogger("kicad_interface")
@@ -360,8 +361,12 @@ class SchematicBatchCommands:
                     else (fd if fd is not None else default)
                 )
 
-            old_value = _field_value("Value", new_type)
-            old_footprint = _field_value("Footprint", "")
+            # A database part is defined by its row: its Value, Footprint and
+            # fields replace the old ones, and an old field survives only where
+            # the row leaves it empty. Any other symbol keeps the old values.
+            target_is_db = loader.is_database_library(new_library)
+            old_value = "" if target_is_db else _field_value("Value", new_type)
+            old_footprint = "" if target_is_db else _field_value("Footprint", "")
 
             try:
                 content = loader.inject_symbol_text(original, new_library, new_type)
@@ -401,8 +406,11 @@ class SchematicBatchCommands:
             )
 
             fields_to_restore = {}
+            remove_old_fields = bool(params.get("removeOldFields", False))
             for fname, fdata in old_fields.items():
                 if fname in ("Reference", "Value", "Footprint"):
+                    continue
+                if remove_old_fields:
                     continue
                 fields_to_restore[fname] = (
                     fdata.get("value", "") if isinstance(fdata, dict) else str(fdata)
@@ -418,6 +426,13 @@ class SchematicBatchCommands:
                 new_start, new_end = loader.placed_span
                 new_block = content[new_start : new_end + 1]
                 for fname, fval in fields_to_restore.items():
+                    if target_is_db:
+                        current = re.search(
+                            r'\(property\s+"' + re.escape(fname) + r'"\s+' + QUOTED_VALUE,
+                            new_block,
+                        )
+                        if current and current.group(1):
+                            continue
                     new_block, _action = self.iface._set_property_in_block(
                         new_block, fname, {"value": fval}, (old_x, old_y)
                     )
@@ -425,17 +440,26 @@ class SchematicBatchCommands:
 
             write_text_atomic(sch_file, content, newline)
 
-            pin_locator = PinLocator()
-            pins_raw = pin_locator.get_all_symbol_pins(sch_file, reference) or {}
-            pins_def = pin_locator.get_symbol_pins(sch_file, f"{new_library}:{new_type}") or {}
-            pins = {
-                pin_num: {
-                    "x": coords[0],
-                    "y": coords[1],
-                    "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
+            # The replace is on disk now; pin coordinates are a convenience for
+            # the caller, so a parser that cannot read the result must not turn
+            # the response into a failure.
+            pins: Dict[str, Any] = {}
+            pins_warning = None
+            try:
+                pin_locator = PinLocator()
+                pins_raw = pin_locator.get_all_symbol_pins(sch_file, reference) or {}
+                pins_def = pin_locator.get_symbol_pins(sch_file, f"{new_library}:{new_type}") or {}
+                pins = {
+                    pin_num: {
+                        "x": coords[0],
+                        "y": coords[1],
+                        "name": pins_def.get(str(pin_num), {}).get("name", str(pin_num)),
+                    }
+                    for pin_num, coords in pins_raw.items()
                 }
-                for pin_num, coords in pins_raw.items()
-            }
+            except Exception as e:
+                pins_warning = f"{reference} was replaced, but its pins could not be read: {e}"
+                logger.warning(pins_warning)
 
             return {
                 "success": True,
@@ -444,6 +468,7 @@ class SchematicBatchCommands:
                 "position": {"x": old_x, "y": old_y, "rotation": use_rotation},
                 "pins": pins,
                 "message": f"Replaced {reference} with {new_symbol} at ({old_x}, {old_y})",
+                **({"warning": pins_warning} if pins_warning else {}),
             }
 
         except Exception as e:

@@ -14,8 +14,10 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from commands.database_library import DatabaseLibrary, DatabaseLibraryError
 from commands.library_resolution import describe_unusable, find_library
 from utils.file_io import read_text_preserve_newline, write_text_atomic
+from utils.platform_helper import PlatformHelper
 from utils.sexpr_format import (
     QUOTED_VALUE,
     QUOTED_VALUE_SKIP,
@@ -93,6 +95,8 @@ class DynamicSymbolLoader:
         # (start, end) of the (symbol ...) block component_instance_text added
         # last, end inclusive, as offsets into the text it returned.
         self.placed_span: Optional[Tuple[int, int]] = None
+        # "Lib:Symbol" -> why a database library could not supply that symbol.
+        self._database_misses: Dict[str, str] = {}
 
     @staticmethod
     def clear_library_caches() -> None:
@@ -438,6 +442,8 @@ class DynamicSymbolLoader:
         lib_path = self.find_library_file(library_name)
         if not lib_path:
             return None
+        if lib_path.suffix == ".kicad_dbl":
+            return self._extract_database_symbol(library_name, lib_path, symbol_name)
 
         # The physical file the symbol lives in: for a KiCAD 10 directory
         # library each symbol is its own shard file.
@@ -514,6 +520,99 @@ class DynamicSymbolLoader:
         logger.info(f"Extracted symbol {full_name} ({len(result)} chars)")
         return result
 
+    def is_database_library(self, library_name: str) -> bool:
+        """Whether *library_name* is a (type "Database") library."""
+        lib_path = self.find_library_file(library_name)
+        return lib_path is not None and lib_path.suffix == ".kicad_dbl"
+
+    def _extract_database_symbol(
+        self, library_name: str, dbl_path: Path, symbol_name: str
+    ) -> Optional[str]:
+        """The lib_symbols block for database part *symbol_name*, or None.
+
+        As KiCad builds it: the library symbol named in the row's symbols
+        column, renamed ``<library name>/<key>``, with the row's first
+        footprint, its description and every mapped field. Not cached across
+        calls: the row is the source of truth and one query is cheap.
+        """
+        full = f"{library_name}:{symbol_name}"
+        try:
+            part = DatabaseLibrary(dbl_path, PlatformHelper.load_kicad_env_vars()).part(symbol_name)
+        except DatabaseLibraryError as e:
+            self._database_misses[full] = str(e)
+            logger.warning(str(e))
+            return None
+        base_lib, sep, base_sym = part.symbol.partition(":")
+        if not sep or not base_lib or not base_sym:
+            self._database_misses[full] = (
+                f"Database part {full} names no symbol (symbols column: '{part.symbol}')"
+            )
+            return None
+        if base_lib == library_name:
+            self._database_misses[full] = (
+                f"Database part {full} is drawn by {part.symbol}, in the database library itself"
+            )
+            return None
+        base = self.extract_symbol_from_library(base_lib, base_sym)
+        if base is None:
+            self._database_misses[full] = (
+                f"Database part {full} is drawn by {part.symbol}, which cannot be loaded: "
+                + self.describe_symbol_miss(base_lib, base_sym)
+            )
+            return None
+
+        block = base.replace(
+            f'(symbol "{base_lib}:{base_sym}"', f'(symbol "{escape_sexpr_string(full)}"', 1
+        )
+        block = re.sub(
+            r'\(symbol "' + re.escape(base_sym) + r'_(\d+)_(\d+)"',
+            lambda m: f'(symbol "{escape_sexpr_string(symbol_name)}_{m.group(1)}_{m.group(2)}"',
+            block,
+        )
+        if part.footprints:
+            block = self._set_lib_property(block, "Footprint", part.footprints[0], hidden=True)
+        if part.description:
+            block = self._set_lib_property(block, "Description", part.description, hidden=True)
+        for name, value, visible, _show_name in part.fields:
+            if name == "Reference":
+                continue
+            block = self._set_lib_property(block, name, value, hidden=not visible)
+        self.symbol_cache[full] = block
+        logger.info(f"Built database symbol {full} from {part.symbol}")
+        return block
+
+    @staticmethod
+    def _set_lib_property(block: str, name: str, value: str, hidden: bool) -> str:
+        """*block* with property *name* set to *value*, added if the symbol lacks it.
+
+        An existing property keeps its position and visibility; only its value
+        changes. A new one goes before the first unit sub-symbol, at the
+        origin, hidden unless *hidden* is False.
+        """
+        m = re.search(
+            r'\(property\s+"' + re.escape(escape_sexpr_string(name)) + r'"\s+' + QUOTED_VALUE,
+            block,
+        )
+        if m:
+            return block[: m.start(1)] + escape_sexpr_string(value) + block[m.end(1) :]
+        hide = " (hide yes)" if hidden else ""
+        prop = (
+            f'(property "{escape_sexpr_string(name)}" "{escape_sexpr_string(value)}"'
+            f" (at 0 0 0) (effects (font (size 1.27 1.27)){hide}))"
+        )
+        # The block may start with indentation, so look for unit sub-symbols
+        # only past the top-level symbol's own "(symbol".
+        top = block.find('(symbol "')
+        sub = block.find('(symbol "', top + 1)
+        if sub == -1:
+            end = block.rstrip().rfind(")")
+            return block[:end] + "  " + prop + "\n" + block[end:]
+        line_start = block.rfind("\n", 0, sub) + 1
+        indent = block[line_start:sub]
+        if indent.strip():
+            return block[:sub] + prop + " " + block[sub:]
+        return block[:line_start] + indent + prop + "\n" + block[line_start:]
+
     def inject_symbol_into_schematic(
         self, schematic_path: Path, library_name: str, symbol_name: str
     ) -> bool:
@@ -534,6 +633,9 @@ class DynamicSymbolLoader:
 
     def describe_symbol_miss(self, library_name: str, symbol_name: str) -> str:
         """Why ``extract_symbol_from_library`` found nothing, in one sentence."""
+        miss = self._database_misses.get(f"{library_name}:{symbol_name}")
+        if miss:
+            return miss
         lib_path = self.find_library_file(library_name)
         if lib_path is not None:
             return f"Symbol '{symbol_name}' not found in library '{library_name}' ({lib_path})"
@@ -1043,6 +1145,31 @@ class DynamicSymbolLoader:
                 or ""
             )
 
+        # A database part's fields are its data (MPN, supplier, part number,
+        # value), so they go onto the placed symbol as KiCad puts them there,
+        # and its Value comes from the row rather than the symbol name.
+        extra_props: List[str] = []
+        if self.is_database_library(library_name):
+            if not value:
+                value = (
+                    self._extract_lib_property_value(
+                        schematic_path, library_name, symbol_name, "Value", content
+                    )
+                    or ""
+                )
+            standard = {"Reference", "Value", "Footprint", "Datasheet", "Description"}
+            for name in lib_props:
+                if name in standard or name.startswith("ki_"):
+                    continue
+                px, py, pa, peff, phide = _prop_at(name, 0, 0, 0)
+                pval = (
+                    self._extract_lib_property_value(
+                        schematic_path, library_name, symbol_name, name, content
+                    )
+                    or ""
+                )
+                extra_props.append(_property(name, pval, px, py, pa, peff, phide))
+
         properties_str = "\n".join(
             [
                 _property("Reference", reference, ref_x, ref_y, ref_a, ref_eff, ref_hide),
@@ -1051,6 +1178,7 @@ class DynamicSymbolLoader:
                 _property("Datasheet", ds_val, ds_x, ds_y, ds_a, ds_eff, True),
                 _property("Description", desc_val, desc_x, desc_y, desc_a, desc_eff, True),
             ]
+            + extra_props
         )
 
         # Per-pin uuids — KiCad writes a (pin "N" (uuid ...)) for every pin of the placed
