@@ -37,6 +37,27 @@ from utils.symbol_instances import annotate_sheet, instance_report
 logger = logging.getLogger("kicad_interface")
 
 
+def _items(sch: Any, attr: str) -> list:
+    """The elements kicad-skip holds under *attr*, as a list ([] when there are none).
+
+    kicad-skip returns an ElementCollection when a sheet has several elements of a
+    kind but the bare element itself when it has exactly one. That element's
+    __bool__ returns a string, so ``getattr(sch, attr) or []`` raised TypeError
+    ("__bool__ should return bool, returned str"), and iterating it yields its
+    fields, not elements.
+    """
+    found = getattr(sch, attr, None)
+    if found is None:
+        return []
+    try:
+        from skip.sexp.parser import ParsedValue
+    except ImportError:  # kicad-skip missing or reorganised: treat as a sequence
+        ParsedValue = ()
+    if ParsedValue and isinstance(found, ParsedValue):
+        return [found]
+    return list(found)
+
+
 def _find_placed_symbol_position(content: str, reference: str) -> Optional[Tuple[float, float]]:
     """Locate the ``(at x y ...)`` origin of the symbol instance ``reference``.
 
@@ -2954,7 +2975,7 @@ class SchematicHandlersMixin:
             point_net: dict = {}  # snap(x,y) -> net_name
 
             for attr in ("label", "global_label", "hierarchical_label"):
-                for lbl in getattr(sch, attr, None) or []:
+                for lbl in _items(sch, attr):
                     try:
                         pos = lbl.at.value
                         name = lbl.value
@@ -2974,7 +2995,7 @@ class SchematicHandlersMixin:
             # name onto the flag's pin, from where the BFS below propagated it
             # over the real net. A PWR_FLAG takes whatever net it is wired to;
             # it never names one.
-            for sym in getattr(sch, "symbol", None) or []:
+            for sym in _items(sch, "symbol"):
                 try:
                     ref = sym.property.Reference.value
                     if not ref.startswith("#PWR"):
@@ -2992,7 +3013,7 @@ class SchematicHandlersMixin:
 
             # ── 2. Build wire adjacency and BFS-propagate net names ──────────
             wire_segments = []
-            for wire in getattr(sch, "wire", None) or []:
+            for wire in _items(sch, "wire"):
                 try:
                     pts = []
                     for pt in wire.pts.xy:
@@ -3031,7 +3052,7 @@ class SchematicHandlersMixin:
 
             # ── 3. Collect real (non-power) symbol pins with their positions ──
             sym_pins = []  # (ref, pin_num, (px, py))
-            for sym in getattr(sch, "symbol", None) or []:
+            for sym in _items(sch, "symbol"):
                 try:
                     ref = sym.property.Reference.value
                     if ref.startswith("#"):
@@ -3103,10 +3124,122 @@ class SchematicHandlersMixin:
         return pad_net_map, all_net_names
 
     def _handle_sync_schematic_to_board(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Sync schematic netlist to PCB board (equivalent to KiCAD F8 'Update PCB from Schematic').
-        Reads net connections from the schematic and assigns them to the matching pads in the PCB.
+        """Update the PCB from the schematic, like KiCad's F8 'Update PCB from Schematic'.
+
+        Connectivity, values and footprint assignments come from kicad-cli's netlist
+        (see commands/board_sync.py). Without kicad-cli this falls back to the older
+        label-geometry sync, which only adds footprints and assigns nets.
         """
-        logger.info("Syncing schematic to board")
+        import shutil
+        import tempfile
+
+        from commands.board_sync import (
+            FOOTPRINT_CHANGE_MODES,
+            NetlistError,
+            SyncOptions,
+            export_netlist,
+            parse_netlist,
+            sync_board,
+        )
+
+        kicad_cli = self._find_kicad_cli_static()
+        if not kicad_cli:
+            logger.warning("kicad-cli not found; using the label-geometry sync")
+            return self._legacy_sync_schematic_to_board(params)
+
+        logger.info("Syncing schematic to board from the kicad-cli netlist")
+        try:
+            board_path = params.get("boardPath")
+            schematic_path = params.get("schematicPath")
+            if board_path:
+                board = self._safe_load_board(board_path)
+                if board is None:
+                    return {"success": False, "message": f"Could not load board from {board_path}"}
+            elif self.board:
+                board = self.board
+                board_path = board.GetFileName()
+            else:
+                return {
+                    "success": False,
+                    "message": "No board loaded. Use open_project first or provide boardPath.",
+                }
+            if not schematic_path:
+                candidate = Path(board_path).with_suffix(".kicad_sch")
+                schematic_path = str(candidate) if candidate.exists() else None
+            if not schematic_path or not Path(schematic_path).exists():
+                return {
+                    "success": False,
+                    "message": f"Schematic not found. Provide schematicPath. Tried: {schematic_path}",
+                }
+
+            mode = params.get("footprintChanges", "replace")
+            if mode not in FOOTPRINT_CHANGE_MODES:
+                return {
+                    "success": False,
+                    "message": f"footprintChanges must be one of {', '.join(FOOTPRINT_CHANGE_MODES)}",
+                }
+            options = SyncOptions(
+                match_by_reference=bool(params.get("matchByReference", True)),
+                footprint_changes=mode,
+                update_values=bool(params.get("updateValues", True)),
+                delete_extra_footprints=bool(params.get("deleteExtraFootprints", False)),
+                rename_track_nets=bool(params.get("renameTrackNets", True)),
+            )
+            dry_run = bool(params.get("dryRun", False))
+
+            netlist = parse_netlist(export_netlist(kicad_cli, schematic_path))
+
+            library_manager = self._get_project_library_manager(Path(schematic_path).parent)
+            prototypes: Dict[str, Any] = {}
+
+            def load_footprint(lib_id: str) -> Any:
+                lib, name = lib_id.split(":", 1)
+                library_path = library_manager.libraries.get(lib)
+                if not library_path:
+                    raise LookupError(f"library '{lib}' is not in any fp-lib-table")
+                if lib_id not in prototypes:
+                    prototypes[lib_id] = pcbnew.FootprintLoad(library_path, name)
+                if prototypes[lib_id] is None:
+                    raise LookupError(f"footprint '{name}' is not in library '{lib}'")
+                return clone_footprint(prototypes[lib_id])
+
+            report = sync_board(board, netlist, load_footprint, options, dry_run=dry_run)
+
+            if not dry_run:
+                # Save beside the board and swap it in, so a failed save never leaves a
+                # half-written board. The scratch folder also catches any project files
+                # pcbnew writes next to the saved board.
+                scratch = Path(tempfile.mkdtemp(prefix=".mcp-sync-", dir=str(Path(board_path).parent)))
+                try:
+                    tmp_board = scratch / Path(board_path).name
+                    with preserve_project_settings(board_path):
+                        board.Save(str(tmp_board))
+                        os.replace(tmp_board, board_path)
+                finally:
+                    shutil.rmtree(scratch, ignore_errors=True)
+                if params.get("boardPath"):
+                    self.board = self._safe_load_board(board_path) or board
+                    self._update_command_handlers()
+
+            return {
+                "success": True,
+                "message": ("Dry run: " if dry_run else "PCB updated from schematic: ") + report["summary"],
+                **report,
+            }
+        except NetlistError as e:
+            return {"success": False, "message": str(e)}
+        except Exception as e:
+            logger.error(f"Error in sync_schematic_to_board: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _legacy_sync_schematic_to_board(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Sync by re-deriving nets from label positions; used only without kicad-cli.
+
+        Adds missing footprints and assigns pad nets; it does not replace, delete or
+        relink footprints. Prefer the kicad-cli path in _handle_sync_schematic_to_board.
+        """
+        logger.info("Syncing schematic to board (label-geometry fallback)")
         try:
             from pathlib import Path
 

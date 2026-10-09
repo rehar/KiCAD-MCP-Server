@@ -1648,12 +1648,48 @@ edit_schematic_component and set its value to an empty string.`,
   // Sync schematic to PCB board (equivalent to KiCAD F8 / "Update PCB from Schematic")
   server.tool(
     "sync_schematic_to_board",
-    "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board.",
+    "Update the PCB from the schematic — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). Nets, values and footprint assignments come from kicad-cli's netlist. Matches footprints by symbol UUID path, or by reference when the board was never linked (e.g. after an import); writes symbol paths; updates values; replaces or relinks footprints whose library link changed; adds missing footprints beside the board outline; reports (optionally deletes) footprints whose symbol is gone; assigns every pad's net; moves tracks/zones with a renamed net. Run with dryRun first to review the change list. MUST be called after the schematic is complete and before placing or routing components on the PCB.",
     {
       schematicPath: z.string().describe("Absolute path to the .kicad_sch schematic file"),
       boardPath: z.string().describe("Absolute path to the .kicad_pcb board file"),
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe("Report every change without modifying the board (default false)"),
+      matchByReference: z
+        .boolean()
+        .optional()
+        .describe(
+          "Match footprints whose UUID path matches no symbol by reference designator (F8's 're-link by reference'; default true)",
+        ),
+      footprintChanges: z
+        .enum(["replace", "relink", "keep"])
+        .optional()
+        .describe(
+          "When a symbol's Footprint field differs from the board footprint's library link: 'replace' loads the library footprint (F8, default), 'relink' only changes the link and keeps the board geometry, 'keep' leaves it",
+        ),
+      updateValues: z.boolean().optional().describe("Copy symbol values onto footprints (default true)"),
+      deleteExtraFootprints: z
+        .boolean()
+        .optional()
+        .describe(
+          "Delete footprints whose symbol no longer exists (default false; locked and blank-reference footprints are never deleted)",
+        ),
+      renameTrackNets: z
+        .boolean()
+        .optional()
+        .describe("Move tracks/vias/zones to the new name when a net was renamed (default true)"),
     },
-    async (args: { schematicPath: string; boardPath: string }) => {
+    async (args: {
+      schematicPath: string;
+      boardPath: string;
+      dryRun?: boolean;
+      matchByReference?: boolean;
+      footprintChanges?: "replace" | "relink" | "keep";
+      updateValues?: boolean;
+      deleteExtraFootprints?: boolean;
+      renameTrackNets?: boolean;
+    }) => {
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

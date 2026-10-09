@@ -6,6 +6,37 @@ All notable changes to the KiCAD MCP Server project are documented here.
 
 ### Bug Fixes
 
+- **`sync_schematic_to_board` crashed on a sheet with exactly one label** of a
+  kind ("`__bool__ should return bool, returned str`"). kicad-skip returns the
+  bare element rather than a collection when a sheet holds one, and the code
+  took its truth value. Elements are now read through one helper that handles
+  both forms.
+- **`sync_schematic_to_board` is now an "Update PCB from Schematic".** It used
+  to re-derive nets from label positions, which disagreed with KiCad on bus
+  members, hierarchical names and label priority, and it only added footprints
+  and assigned nets. It now takes nets, values and footprint assignments from
+  kicad-cli's netlist and, like F8:
+  - matches footprints by symbol UUID path, or by reference when the board was
+    never linked (`matchByReference`, e.g. a board from the Altium importer),
+    and writes the symbol path, sheet name and sheet file into each footprint,
+    so the next sync matches by UUID;
+  - updates values (`updateValues`);
+  - handles footprints whose library link changed (`footprintChanges`):
+    `replace` loads the library footprint in place, keeping position,
+    orientation, side, lock and field placement; `relink` changes only the link
+    and keeps the board geometry; `keep` leaves it. The report says per
+    footprint whether the library pads match the board's;
+  - adds missing footprints in a row beside the board outline, and reports any
+    whose footprint cannot be loaded instead of adding an empty part;
+  - reports footprints whose symbol is gone and deletes them on request
+    (`deleteExtraFootprints`), never locked ones or ones with a blank reference;
+  - assigns every pad's net, and moves tracks, vias and zones to the new name
+    when every pad of a net moved to the same new net (`renameTrackNets`);
+  - takes `dryRun` to return the change list without touching the board, and
+    saves the board atomically.
+
+  Without kicad-cli it falls back to the previous label-based sync.
+
 - **`replace_schematic_component` deleted the part when the new symbol could
   not be loaded.** It removed the old symbol and wrote the file before loading
   the new one, so an unknown library or symbol left the part gone and its

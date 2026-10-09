@@ -2676,7 +2676,15 @@ SCHEMATIC_TOOLS = [
     {
         "name": "sync_schematic_to_board",
         "title": "Sync Schematic to PCB (F8)",
-        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. Must be called after placing components and before routing traces, so that pad-to-net assignments are correct.",
+        "description": (
+            "Update the PCB from the schematic, like KiCad's F8 'Update PCB from Schematic'. Nets, "
+            "values and footprint assignments come from kicad-cli's netlist. Matches footprints to "
+            "symbols by UUID path (and by reference when the board was never linked, e.g. after an "
+            "import), writes the symbol path into each footprint, updates values, replaces or relinks "
+            "footprints whose library link changed, adds missing footprints beside the board outline, "
+            "reports (optionally deletes) footprints whose symbol is gone, assigns every pad's net, and "
+            "moves tracks/zones along with a renamed net. Use dryRun first to review the change list."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2687,6 +2695,46 @@ SCHEMATIC_TOOLS = [
                 "boardPath": {
                     "type": "string",
                     "description": "Path to .kicad_pcb file. If omitted, uses currently loaded board.",
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "description": "Report every change without modifying the board (default false).",
+                },
+                "matchByReference": {
+                    "type": "boolean",
+                    "description": (
+                        "Match footprints whose UUID path matches no symbol by reference designator, "
+                        "like F8's 'Re-link footprints to schematic symbols based on their reference "
+                        "designators' (default true)."
+                    ),
+                },
+                "footprintChanges": {
+                    "type": "string",
+                    "enum": ["replace", "relink", "keep"],
+                    "description": (
+                        "When a symbol's Footprint field differs from the board footprint's library link: "
+                        "'replace' loads the library footprint in its place (F8 behaviour, default), "
+                        "'relink' only changes the link and keeps the board geometry, 'keep' leaves it. "
+                        "The report says per footprint whether the library pads match the board pads."
+                    ),
+                },
+                "updateValues": {
+                    "type": "boolean",
+                    "description": "Copy symbol values onto footprints (default true).",
+                },
+                "deleteExtraFootprints": {
+                    "type": "boolean",
+                    "description": (
+                        "Delete footprints whose symbol no longer exists (default false). Locked "
+                        "footprints and footprints with a blank reference are never deleted."
+                    ),
+                },
+                "renameTrackNets": {
+                    "type": "boolean",
+                    "description": (
+                        "Move tracks, vias and zones to the new name when every pad of a net moved to "
+                        "the same new net (default true)."
+                    ),
                 },
             },
         },
