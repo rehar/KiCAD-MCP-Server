@@ -4,6 +4,48 @@ All notable changes to the KiCAD MCP Server project are documented here.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`replace_schematic_component` deleted the part when the new symbol could
+  not be loaded.** It removed the old symbol and wrote the file before loading
+  the new one, so an unknown library or symbol left the part gone and its
+  wires dangling. The replacement is now built in memory and written once, and
+  any failure leaves the file byte-identical. `add_schematic_component` also
+  writes once instead of twice.
+- **Libraries behind a nested table or a `kicad_common.json` path variable
+  could not be placed.** The symbol loader kept its own `sym-lib-table`
+  reader, which neither followed `(type "Table")` rows nor expanded variables
+  defined under Preferences > Configure Paths, so `add_schematic_component` and
+  `replace_schematic_component` reported such libraries as not found. Library
+  lookup now follows KiCad's rules (project table first, first row wins, Table
+  rows followed) and names the undefined variable or missing file when a
+  library cannot be opened.
+- **A library registered after the server started stayed "not found".** The
+  symbol and footprint library managers read the tables once per process. They
+  now reload when a table, a nested table or `kicad_common.json` changes. They
+  also find the global table the same way the other tools do, honouring
+  `KICAD_CONFIG_HOME` and `XDG_CONFIG_HOME`.
+- **`get_footprint_info` ignored `library_name`** and failed with a generic
+  error when the footprint was missing. It now looks in the named library and
+  says whether the library or the footprint was not found.
+
+### Features
+
+- **KiCad database libraries (`.kicad_dbl`).** Parts of a `(type "Database")`
+  library, named `<library>/<key>`, can be placed, used as a
+  `replace_schematic_component` target, and found with `get_symbol_info` and
+  `search_symbols`. The part is built as KiCad builds it: the symbol from the
+  row's symbols column, its first footprint, its description and every mapped
+  field. The source is opened with `pyodbc` when installed (any ODBC driver),
+  and SQLite sources also work without it through Python's `sqlite3`.
+  `replace_schematic_component` takes a database part's Value, Footprint and
+  fields from its row, and gains `removeOldFields`.
+- **`replace_instance_lib_ids` relinks per reference.** `byReference` maps a
+  reference to a new lib_id, for parts that share one importer lib_id but need
+  different targets. Each unit is relinked in place without moving anything,
+  the new symbol is loaded into `lib_symbols`, and a target whose pins sit
+  elsewhere is refused unless `allowPinChange` is set.
+
 ## [2.8.2] - 2026-09-25
 
 ### Bug Fixes
