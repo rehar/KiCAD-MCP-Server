@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from utils.file_io import read_text_preserve_newline, write_text_atomic
 from utils.sexpr_format import (
     QUOTED_VALUE,
     QUOTED_VALUE_SKIP,
@@ -88,6 +89,9 @@ class DynamicSymbolLoader:
         # create_component_instance placed last; more than one when the sheet
         # is used more than once.
         self.placed_instances: List[Tuple[str, str]] = []
+        # (start, end) of the (symbol ...) block component_instance_text added
+        # last, end inclusive, as offsets into the text it returned.
+        self.placed_span: Optional[Tuple[int, int]] = None
 
     @staticmethod
     def clear_library_caches() -> None:
@@ -595,15 +599,30 @@ class DynamicSymbolLoader:
         Inject a symbol definition into a schematic's lib_symbols section.
         Uses text manipulation to preserve file formatting.
         """
-        full_name = f"{library_name}:{symbol_name}"
+        content, newline = read_text_preserve_newline(Path(schematic_path))
+        updated = self.inject_symbol_text(content, library_name, symbol_name)
+        if updated != content:
+            write_text_atomic(Path(schematic_path), updated, newline)
+            # Handle both Path objects and strings
+            sch_name = (
+                schematic_path.name if hasattr(schematic_path, "name") else str(schematic_path)
+            )
+            logger.info(f"Injected symbol {library_name}:{symbol_name} into {sch_name}")
+        return True
 
-        with open(schematic_path, "r", encoding="utf-8") as f:
-            content = f.read()
+    def inject_symbol_text(self, content: str, library_name: str, symbol_name: str) -> str:
+        """Return *content* with the library symbol added to its lib_symbols section.
+
+        Pure text transform: nothing is written, so a caller composing several
+        edits (replace_schematic_component) can fail at any step and leave the
+        file untouched. Raises ValueError when the symbol cannot be loaded.
+        """
+        full_name = f"{library_name}:{symbol_name}"
 
         # Check if symbol already exists
         if f'(symbol "{full_name}"' in content:
             logger.info(f"Symbol {full_name} already exists in schematic")
-            return True
+            return content
 
         # Extract symbol from library
         symbol_block = self.extract_symbol_from_library(library_name, symbol_name)
@@ -637,15 +656,7 @@ class DynamicSymbolLoader:
             raise ValueError("No lib_symbols section found in schematic")
 
         # Insert the symbol block just before the closing ) of lib_symbols
-        content = content[:lib_sym_end] + "\n    " + indented_block + "\n  " + content[lib_sym_end:]
-
-        with open(schematic_path, "w", encoding="utf-8") as f:
-            f.write(content)
-
-        # Handle both Path objects and strings
-        sch_name = schematic_path.name if hasattr(schematic_path, "name") else str(schematic_path)
-        logger.info(f"Injected symbol {full_name} into {sch_name}")
-        return True
+        return content[:lib_sym_end] + "\n    " + indented_block + "\n  " + content[lib_sym_end:]
 
     @staticmethod
     def _extract_paren_block(text: str, start: int) -> str:
@@ -666,6 +677,7 @@ class DynamicSymbolLoader:
         schematic_path: Path,
         library_name: str,
         symbol_name: str,
+        content: Optional[str] = None,
     ) -> dict:
         """
         Return {prop_name: (dx, dy, text_angle, effects_str, hidden)} from the
@@ -679,8 +691,8 @@ class DynamicSymbolLoader:
         Returns an empty dict on failure.
         """
         try:
-            with open(schematic_path, encoding="utf-8") as f:
-                content = f.read()
+            if content is None:
+                content = Path(schematic_path).read_text(encoding="utf-8")
 
             lib_start = content.find("(lib_symbols")
             if lib_start == -1:
@@ -827,7 +839,12 @@ class DynamicSymbolLoader:
         return self._build_instance_paths(schematic_path)[0]
 
     def _extract_symbol_pins(
-        self, schematic_path: Path, library_name: str, symbol_name: str, unit: int
+        self,
+        schematic_path: Path,
+        library_name: str,
+        symbol_name: str,
+        unit: int,
+        content: Optional[str] = None,
     ) -> List[str]:
         """Return string-sorted pin numbers for the placed unit (plus shared unit-0 pins).
 
@@ -838,7 +855,8 @@ class DynamicSymbolLoader:
         ordering (ascending string sort).
         """
         try:
-            content = Path(schematic_path).read_text(encoding="utf-8")
+            if content is None:
+                content = Path(schematic_path).read_text(encoding="utf-8")
             lib_start = content.find("(lib_symbols")
             if lib_start == -1:
                 return []
@@ -866,7 +884,12 @@ class DynamicSymbolLoader:
             return []
 
     def _extract_lib_property_value(
-        self, schematic_path: Path, library_name: str, symbol_name: str, prop_name: str
+        self,
+        schematic_path: Path,
+        library_name: str,
+        symbol_name: str,
+        prop_name: str,
+        content: Optional[str] = None,
     ) -> Optional[str]:
         """Return a top-level property value from the injected lib symbol, or None.
 
@@ -874,7 +897,8 @@ class DynamicSymbolLoader:
         KiCad-authored output (KiCad carries these fields on every symbol).
         """
         try:
-            content = Path(schematic_path).read_text(encoding="utf-8")
+            if content is None:
+                content = Path(schematic_path).read_text(encoding="utf-8")
             lib_start = content.find("(lib_symbols")
             if lib_start == -1:
                 return None
@@ -906,6 +930,49 @@ class DynamicSymbolLoader:
         """
         Add a component instance to the schematic.
         This creates the (symbol ...) block with lib_id reference.
+
+        Reads the file, applies component_instance_text and writes the result
+        once; see there for the arguments.
+        """
+        content, newline = read_text_preserve_newline(Path(schematic_path))
+        content = self.component_instance_text(
+            schematic_path,
+            content,
+            library_name,
+            symbol_name,
+            reference=reference,
+            value=value,
+            footprint=footprint,
+            x=x,
+            y=y,
+            unit=unit,
+            angle=angle,
+            mirror_y=mirror_y,
+        )
+        write_text_atomic(Path(schematic_path), content, newline)
+        return True
+
+    def component_instance_text(
+        self,
+        schematic_path: Path,
+        content: str,
+        library_name: str,
+        symbol_name: str,
+        reference: str,
+        value: str = "",
+        footprint: str = "",
+        x: float = 0,
+        y: float = 0,
+        unit: int = 1,
+        angle: float = 0,
+        mirror_y: bool = False,
+    ) -> str:
+        """
+        Return *content* with a placed (symbol ...) instance added.
+
+        *content* must already carry the library symbol in lib_symbols
+        (inject_symbol_text). Nothing is written; *schematic_path* is only used
+        to locate the project and sheet hierarchy for the instance paths.
 
         Property positions and text angles are derived from the library symbol
         definition so that RefDes/Value are always placed correctly for the
@@ -939,7 +1006,9 @@ class DynamicSymbolLoader:
         x, y = snapped_x, snapped_y
 
         # --- read property offsets from the already-injected lib_symbols block -----
-        lib_props = self._extract_lib_property_positions(schematic_path, library_name, symbol_name)
+        lib_props = self._extract_lib_property_positions(
+            schematic_path, library_name, symbol_name, content
+        )
 
         _DEFAULT_EFFECTS = "(effects (font (size 1.27 1.27)))"
 
@@ -1015,12 +1084,12 @@ class DynamicSymbolLoader:
         # the placeholder "~" datasheet to an empty string, so mirror that to keep the
         # generated instance byte-stable across a KiCad save (round-trip).
         ds_val = self._extract_lib_property_value(
-            schematic_path, library_name, symbol_name, "Datasheet"
+            schematic_path, library_name, symbol_name, "Datasheet", content
         )
         ds_val = "" if ds_val in (None, "~") else ds_val
         desc_val = (
             self._extract_lib_property_value(
-                schematic_path, library_name, symbol_name, "Description"
+                schematic_path, library_name, symbol_name, "Description", content
             )
             or ""
         )
@@ -1034,7 +1103,7 @@ class DynamicSymbolLoader:
         if not footprint:
             footprint = (
                 self._extract_lib_property_value(
-                    schematic_path, library_name, symbol_name, "Footprint"
+                    schematic_path, library_name, symbol_name, "Footprint", content
                 )
                 or ""
             )
@@ -1051,7 +1120,9 @@ class DynamicSymbolLoader:
 
         # Per-pin uuids — KiCad writes a (pin "N" (uuid ...)) for every pin of the placed
         # unit; their absence is a primary cause of editor crashes when the symbol is dragged.
-        pin_numbers = self._extract_symbol_pins(schematic_path, library_name, symbol_name, unit)
+        pin_numbers = self._extract_symbol_pins(
+            schematic_path, library_name, symbol_name, unit, content
+        )
         pins_str = "\n".join(f'    (pin "{n}" (uuid "{uuid.uuid4()}"))' for n in pin_numbers)
 
         # Real project name + hierarchical sheet path (not the "project" / "/"
@@ -1082,9 +1153,6 @@ class DynamicSymbolLoader:
         )
 
         body = "\n".join(part for part in [properties_str, pins_str, instances_str] if part)
-
-        with open(schematic_path, "r", encoding="utf-8") as f:
-            content = f.read()
 
         # Emit the KiCad 10-only symbol attributes only into files whose declared
         # format version accepts them (#351). A KiCad 8 or 9 file never contains
@@ -1125,11 +1193,10 @@ class DynamicSymbolLoader:
         else:
             content = content[:insert_at] + instance_block + "\n  " + content[insert_at:]
 
-        with open(schematic_path, "w", encoding="utf-8") as f:
-            f.write(content)
-
+        # instance_block opens with two spaces of indent and ends on its ")".
+        self.placed_span = (insert_at + 2, insert_at + len(instance_block) - 1)
         logger.info(f"Added component instance {reference} ({full_lib_id}) at ({x}, {y})")
-        return True
+        return content
 
     def load_symbol_dynamically(
         self, schematic_path: Path, library_name: str, symbol_name: str
@@ -1187,12 +1254,15 @@ class DynamicSymbolLoader:
         """
         if project_path:
             self.project_path = project_path
-        # Ensure symbol definition is in lib_symbols
-        self.inject_symbol_into_schematic(schematic_path, library_name, symbol_name)
-
-        # Add the component instance (property positions come from the injected lib def)
-        return self.create_component_instance(
+        content, newline = read_text_preserve_newline(Path(schematic_path))
+        # Ensure symbol definition is in lib_symbols, then add the instance
+        # (property positions come from the injected lib def). Both edits are
+        # made in memory and written once, so a symbol that cannot be loaded
+        # leaves the file as it was.
+        content = self.inject_symbol_text(content, library_name, symbol_name)
+        content = self.component_instance_text(
             schematic_path,
+            content,
             library_name,
             symbol_name,
             reference=reference,
@@ -1204,6 +1274,8 @@ class DynamicSymbolLoader:
             angle=angle,
             mirror_y=mirror_y,
         )
+        write_text_atomic(Path(schematic_path), content, newline)
+        return True
 
 
 if __name__ == "__main__":

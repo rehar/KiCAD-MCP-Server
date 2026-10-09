@@ -267,7 +267,9 @@ class TestPlacementOnASheetUsedTwice:
 
     def test_batch_add_components_reports_each_use(self, tmp_path, monkeypatch):
         # No symbol library needed: the placed instance is what is checked.
-        monkeypatch.setattr(DynamicSymbolLoader, "inject_symbol_into_schematic", lambda *a: None)
+        monkeypatch.setattr(
+            DynamicSymbolLoader, "inject_symbol_text", lambda self, content, *a: content
+        )
         amp = self._hierarchy(tmp_path)
         r = SchematicBatchCommands(SimpleNamespace()).batch_add_components(
             {

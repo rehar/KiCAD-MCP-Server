@@ -28,6 +28,7 @@ from commands.schematic_text_utils import (
     _move_property_in_block,
 )
 from commands.wire_manager import WireManager
+from utils.file_io import read_text_preserve_newline, write_text_atomic
 from utils.symbol_instances import add_missing_instances, instance_report
 
 logger = logging.getLogger("kicad_interface")
@@ -336,21 +337,17 @@ class SchematicBatchCommands:
             old_fields = comp_info.get("fields", {})
             use_rotation = new_rotation if new_rotation is not None else old_rotation
 
-            content = sch_file.read_text(encoding="utf-8")
-            block_text, block_start, block_end = _find_placed_symbol_block(content, reference)
+            # Every step below edits text in memory; the file is written once,
+            # at the end. Removing the old symbol first and loading the new one
+            # afterwards (the previous order) deleted the part outright whenever
+            # the new symbol could not be loaded.
+            original, newline = read_text_preserve_newline(sch_file)
+            block_text, block_start, block_end = _find_placed_symbol_block(original, reference)
             if block_text is None:
                 return {
                     "success": False,
                     "message": f"Component '{reference}' not found in schematic file",
                 }
-
-            trim_start = block_start
-            while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
-                trim_start -= 1
-            if trim_start > 0 and content[trim_start - 1] == "\n":
-                trim_start -= 1
-            content = content[:trim_start] + content[block_end + 1 :]
-            sch_file.write_text(content, encoding="utf-8")
 
             derived_project_path = _find_project_root(sch_file.parent)
             loader = DynamicSymbolLoader(project_path=derived_project_path)
@@ -366,8 +363,33 @@ class SchematicBatchCommands:
             old_value = _field_value("Value", new_type)
             old_footprint = _field_value("Footprint", "")
 
-            loader.add_component(
+            try:
+                content = loader.inject_symbol_text(original, new_library, new_type)
+            except ValueError as e:
+                return {
+                    "success": False,
+                    "message": f"Cannot load {new_symbol}: {e}. {reference} was not changed.",
+                }
+
+            # inject_symbol_text only appends inside lib_symbols, which precedes
+            # every placed symbol, so the old block moved by exactly the growth.
+            shift = len(content) - len(original)
+            if content[block_start + shift : block_end + shift + 1] != block_text:
+                return {
+                    "success": False,
+                    "message": f"Replacing {reference} failed: its symbol block moved while "
+                    f"loading {new_symbol}. {reference} was not changed.",
+                }
+            trim_start = block_start + shift
+            while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
+                trim_start -= 1
+            if trim_start > 0 and content[trim_start - 1] == "\n":
+                trim_start -= 1
+            content = content[:trim_start] + content[block_end + shift + 1 :]
+
+            content = loader.component_instance_text(
                 sch_file,
+                content,
                 new_library,
                 new_type,
                 reference=reference,
@@ -376,7 +398,6 @@ class SchematicBatchCommands:
                 x=old_x,
                 y=old_y,
                 angle=use_rotation,
-                project_path=derived_project_path,
             )
 
             fields_to_restore = {}
@@ -388,29 +409,21 @@ class SchematicBatchCommands:
                 )
 
             if fields_to_restore:
-                # Restore the remaining fields through the block-scoped component
-                # editor. A plain regex substitution over the whole file (the
-                # previous implementation) replaced the FIRST matching
-                # (property "<name>" ...) in the file, which for common field
-                # names like "Description" lives inside lib_symbols — corrupting
-                # an unrelated library symbol definition instead of this
-                # component instance.
-                restore_result = self.iface._handle_edit_schematic_component(
-                    {
-                        "schematicPath": schematic_path,
-                        "reference": reference,
-                        "properties": {
-                            fname: {"value": fval} for fname, fval in fields_to_restore.items()
-                        },
-                    }
-                )
-                if not restore_result.get("success"):
-                    logger.warning(
-                        "Could not restore fields %s on %s after replace: %s",
-                        sorted(fields_to_restore),
-                        reference,
-                        restore_result.get("message"),
+                # Restore the remaining fields inside the new instance block
+                # only. A substitution over the whole file would hit the FIRST
+                # matching (property "<name>" ...), which for common field names
+                # like "Description" lives inside lib_symbols — corrupting an
+                # unrelated library symbol definition instead of this component.
+                assert loader.placed_span is not None  # set by component_instance_text
+                new_start, new_end = loader.placed_span
+                new_block = content[new_start : new_end + 1]
+                for fname, fval in fields_to_restore.items():
+                    new_block, _action = self.iface._set_property_in_block(
+                        new_block, fname, {"value": fval}, (old_x, old_y)
                     )
+                content = content[:new_start] + new_block + content[new_end + 1 :]
+
+            write_text_atomic(sch_file, content, newline)
 
             pin_locator = PinLocator()
             pins_raw = pin_locator.get_all_symbol_pins(sch_file, reference) or {}
